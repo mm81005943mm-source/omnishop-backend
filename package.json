@@ -1,16 +1,36 @@
 {
   "name": "omnishop-backend",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
+  "description": "OmniShop API backend with OAuth and session routes",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "build": "esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "db:migrate:production": "node scripts/db-migrate-production.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "express": "^5.2.1"
+    "@trpc/client": "11.7.2",
+    "@trpc/react-query": "11.7.2",
+    "@trpc/server": "11.7.2",
+    "axios": "^1.13.0",
+    "cookie": "^1.1.1",
+    "dotenv": "^16.6.1",
+    "drizzle-orm": "^0.44.7",
+    "esbuild": "^0.25.12",
+    "express": "^4.22.1",
+    "jose": "6.1.0",
+    "mysql2": "^3.16.0",
+    "superjson": "^1.13.0",
+    "tsx": "^4.21.0",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.3"
   }
 }
