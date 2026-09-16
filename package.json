@@ -4,9 +4,9 @@
   "description": "OmniShop API backend with OAuth and session routes",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
     "start": "node index.js",
-    "build": "esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "build": "esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=cjs --outdir=dist",
     "db:migrate:production": "node scripts/db-migrate-production.mjs"
   },
   "keywords": [],
@@ -31,6 +31,7 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
-    "@types/node": "^22.20.3"
+    "@types/node": "^22.20.3",
+    "vitest": "^2.1.9"
   }
 }
