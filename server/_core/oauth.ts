@@ -80,6 +80,46 @@ function consumeHandoff(code: string) {
 }
 
 export function registerOAuthRoutes(app: Express) {
+  // Native Android Google Sign-In: the app obtains the ID token with the
+  // native Google SDK and sends it directly to OmniShop. Do not use the
+  // browser OAuth callback for this flow.
+  app.post("/api/auth/google/native", async (req: Request, res: Response) => {
+    const googleClientId = process.env.GOOGLE_CLIENT_ID_WEB?.trim();
+    if (!googleClientId) {
+      res.status(503).json({ error: "Google OAuth is not configured" });
+      return;
+    }
+
+    const idToken = typeof req.body?.idToken === "string" ? req.body.idToken.trim() : "";
+    if (!idToken || idToken.length > 16_384) {
+      res.status(401).json({ error: "Google authentication failed" });
+      return;
+    }
+
+    try {
+      const claims = await verifyGoogleIdToken(idToken, googleClientId);
+      const verified = validateGoogleClaims(claims, googleClientId);
+      const user = await syncUser({
+        openId: `google:${verified.sub}`,
+        name: verified.name ?? null,
+        email: verified.email,
+        loginMethod: "google",
+        platform: "native",
+      });
+      const sessionToken = await sdk.createSessionToken(`google:${verified.sub}`, {
+        name: verified.name ?? "",
+        expiresInMs: ONE_YEAR_MS,
+      });
+      res.json({
+        app_session_id: sessionToken,
+        user: buildUserResponse(user),
+      });
+    } catch (error) {
+      console.error("[Google Native] Sign-in failed", error instanceof Error ? error.message : "unknown error");
+      res.status(401).json({ error: "Google authentication failed" });
+    }
+  });
+
   // Direct Google OAuth start. The requested client redirect is only accepted when
   // explicitly allowlisted in GOOGLE_CLIENT_REDIRECT_URIS.
   app.get("/api/auth/google", (req: Request, res: Response) => {
