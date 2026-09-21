@@ -85,10 +85,11 @@ export function registerOAuthRoutes(app: Express) {
   // native Google SDK and sends it directly to OmniShop. Do not use the
   // browser OAuth callback for this flow.
   app.post("/api/auth/google/native", async (req: Request, res: Response) => {
-    // Native Android tokens are issued for the public web client configured in
-    // the APK. Do not let a stale Render env var cause an audience mismatch.
-    const googleClientId = DEFAULT_GOOGLE_WEB_CLIENT_ID;
-    if (!googleClientId) {
+    // Accept the deployed Web Client ID and the app's known public client ID.
+    // The token is still signature-verified by Google before it is accepted.
+    const googleClientIds = [process.env.GOOGLE_CLIENT_ID_WEB?.trim(), DEFAULT_GOOGLE_WEB_CLIENT_ID]
+      .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
+    if (!googleClientIds.length) {
       res.status(503).json({ error: "Google OAuth is not configured" });
       return;
     }
@@ -100,8 +101,17 @@ export function registerOAuthRoutes(app: Express) {
     }
 
     try {
-      const claims = await verifyGoogleIdToken(idToken, googleClientId);
-      const verified = validateGoogleClaims(claims, googleClientId);
+      let verified: Awaited<ReturnType<typeof verifyGoogleIdToken>> | null = null;
+      for (const clientId of googleClientIds) {
+        try {
+          const claims = await verifyGoogleIdToken(idToken, clientId);
+          verified = validateGoogleClaims(claims, clientId);
+          break;
+        } catch {
+          // Try the next explicitly configured public client ID.
+        }
+      }
+      if (!verified) throw new Error("Google token did not match a configured client ID");
       const user = await syncUser({
         openId: `google:${verified.sub}`,
         name: verified.name ?? null,
