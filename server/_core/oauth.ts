@@ -9,6 +9,7 @@ import {
   getGoogleOAuthConfig,
   isGoogleOAuthConfigured,
   OAuthStateStore,
+  DEFAULT_GOOGLE_WEB_CLIENT_ID,
   validateGoogleClaims,
   verifyGoogleIdToken,
 } from "./google-oauth";
@@ -84,7 +85,7 @@ export function registerOAuthRoutes(app: Express) {
   // native Google SDK and sends it directly to OmniShop. Do not use the
   // browser OAuth callback for this flow.
   app.post("/api/auth/google/native", async (req: Request, res: Response) => {
-    const googleClientId = process.env.GOOGLE_CLIENT_ID_WEB?.trim();
+    const googleClientId = process.env.GOOGLE_CLIENT_ID_WEB?.trim() || DEFAULT_GOOGLE_WEB_CLIENT_ID;
     if (!googleClientId) {
       res.status(503).json({ error: "Google OAuth is not configured" });
       return;

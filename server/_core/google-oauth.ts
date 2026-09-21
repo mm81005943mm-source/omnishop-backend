@@ -2,6 +2,10 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from "jose";
 
 export const GOOGLE_ISSUERS = new Set(["https://accounts.google.com", "accounts.google.com"]);
+// Public OAuth client ID used by the Android app. It may still be overridden
+// by the deployment environment, but the fallback prevents a blank or stale
+// Render variable from making native sign-in reject every valid Google token.
+export const DEFAULT_GOOGLE_WEB_CLIENT_ID = "994658294818-hcaup95copgvc327i4or6q4pq50b59qc.apps.googleusercontent.com";
 
 export type GoogleOAuthConfig = {
   clientId: string;
@@ -162,7 +166,7 @@ export async function fetchGoogleUserInfo(
 
 export function getGoogleOAuthConfig(env: NodeJS.ProcessEnv = process.env): GoogleOAuthConfig {
   return {
-    clientId: env.GOOGLE_CLIENT_ID_WEB ?? "",
+    clientId: env.GOOGLE_CLIENT_ID_WEB?.trim() || DEFAULT_GOOGLE_WEB_CLIENT_ID,
     clientSecret: env.GOOGLE_CLIENT_SECRET_WEB ?? "",
     redirectUri: env.GOOGLE_REDIRECT_URI ?? "",
     authorizationEndpoint: env.GOOGLE_AUTHORIZATION_ENDPOINT,
