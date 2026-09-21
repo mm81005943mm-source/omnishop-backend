@@ -1,7 +1,8 @@
 import { COOKIE_NAME, ONE_YEAR_MS } from "../../shared/const.js";
 import type { Express, Request, Response } from "express";
-import { randomBytes } from "node:crypto";
-import { getUserByOpenId, upsertUser } from "../db";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { getDb, getUserByOpenId, upsertUser } from "../db";
+import { sql } from "drizzle-orm";
 import { getSessionCookieOptions } from "./cookies";
 import {
   buildGoogleAuthorizationUrl,
@@ -132,6 +133,80 @@ export function registerOAuthRoutes(app: Express) {
       res.status(401).json({ error: "Google authentication failed" });
     }
   });
+
+  // Email/password authentication does not depend on Google OAuth or Android signing.
+  let emailAuthReady: Promise<void> | null = null;
+  const ensureEmailAuthTable = async () => {
+    if (!emailAuthReady) {
+      emailAuthReady = (async () => {
+        const db = await getDb();
+        if (!db) throw new Error("Database is not configured");
+        await db.execute(sql`CREATE TABLE IF NOT EXISTS email_credentials (
+          user_id INT NOT NULL PRIMARY KEY,
+          email VARCHAR(320) NOT NULL UNIQUE,
+          password_hash VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          CONSTRAINT email_credentials_user_fk FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )`);
+      })();
+    }
+    return emailAuthReady;
+  };
+  const normalizeEmail = (value: unknown) => typeof value === "string" ? value.trim().toLowerCase() : "";
+  const hashPassword = (password: string) => {
+    const salt = randomBytes(16).toString("hex");
+    const derived = scryptSync(password, salt, 64).toString("hex");
+    return `${salt}:${derived}`;
+  };
+  const verifyPassword = (password: string, encoded: string) => {
+    const [salt, expected] = encoded.split(":");
+    if (!salt || !expected) return false;
+    const actual = scryptSync(password, salt, 64);
+    const target = Buffer.from(expected, "hex");
+    return target.length === actual.length && timingSafeEqual(actual, target);
+  };
+  const emailUserResponse = (user: any) => ({
+    id: user?.id ?? null, openId: user?.openId ?? null, name: user?.name ?? null,
+    email: user?.email ?? null, loginMethod: "email", lastSignedIn: new Date().toISOString(),
+  });
+  const emailAuth = async (req: Request, res: Response) => {
+    try {
+      await ensureEmailAuthTable();
+      const email = normalizeEmail(req.body?.email);
+      const password = typeof req.body?.password === "string" ? req.body.password : "";
+      const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 120) : "";
+      const register = req.path.endsWith("/register");
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || password.length < 8 || password.length > 128 || (register && !name)) {
+        res.status(400).json({ error: register ? "أدخل الاسم والبريد وكلمة مرور من 8 أحرف على الأقل" : "البريد أو كلمة المرور غير صحيحة" });
+        return;
+      }
+      const db = await getDb();
+      if (!db) throw new Error("Database is not configured");
+      const rows: any = await db.execute(sql`SELECT user_id, password_hash FROM email_credentials WHERE email = ${email} LIMIT 1`);
+      const credential = (rows as any)?.[0]?.[0] ?? (rows as any)?.[0] ?? null;
+      if (register) {
+        if (credential) { res.status(409).json({ error: "هذا البريد مسجل مسبقًا" }); return; }
+        await upsertUser({ openId: `email:${email}`, email, name, loginMethod: "email", lastSignedIn: new Date() });
+        const user = await getUserByOpenId(`email:${email}`);
+        if (!user?.id) throw new Error("Could not create user");
+        await db.execute(sql`INSERT INTO email_credentials (user_id, email, password_hash) VALUES (${user.id}, ${email}, ${hashPassword(password)})`);
+        const token = await sdk.createSessionToken(`email:${email}`, { name, expiresInMs: ONE_YEAR_MS });
+        res.status(201).json({ app_session_id: token, user: emailUserResponse({ ...user, email, name }) });
+        return;
+      }
+      if (!credential || !verifyPassword(password, credential.password_hash)) { res.status(401).json({ error: "البريد أو كلمة المرور غير صحيحة" }); return; }
+      const user = await getUserByOpenId(`email:${email}`);
+      if (!user) { res.status(401).json({ error: "البريد أو كلمة المرور غير صحيحة" }); return; }
+      await upsertUser({ openId: `email:${email}`, lastSignedIn: new Date() });
+      const token = await sdk.createSessionToken(`email:${email}`, { name: user.name ?? "", expiresInMs: ONE_YEAR_MS });
+      res.json({ app_session_id: token, user: emailUserResponse(user) });
+    } catch (error) {
+      console.error("[Email Auth] failed", error instanceof Error ? error.message : "unknown error");
+      res.status(500).json({ error: "تعذر إكمال العملية، حاول مرة أخرى" });
+    }
+  };
+  app.post("/api/auth/email/register", emailAuth);
+  app.post("/api/auth/email/login", emailAuth);
 
   // Direct Google OAuth start. The requested client redirect is only accepted when
   // explicitly allowlisted in GOOGLE_CLIENT_REDIRECT_URIS.
