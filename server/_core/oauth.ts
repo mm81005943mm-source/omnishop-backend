@@ -202,7 +202,7 @@ export function registerOAuthRoutes(app: Express) {
       res.json({ app_session_id: token, user: emailUserResponse(user) });
     } catch (error) {
       console.error("[Email Auth] failed", error instanceof Error ? error.message : "unknown error");
-      res.status(500).json({ error: "تعذر إكمال العملية، حاول مرة أخرى" });
+      res.status(500).json({ error: "تعذر إكمال العملية، حاول مرة أخرى", code: "EMAIL_AUTH_SETUP_FAILED", detail: error instanceof Error ? error.message : "unknown" });
     }
   };
   app.post("/api/auth/email/register", emailAuth);
