@@ -180,7 +180,7 @@ class SDKServer {
     cookieValue: string | undefined | null,
   ): Promise<{ openId: string; appId: string; name: string } | null> {
     if (!cookieValue) {
-      console.warn("[Auth] Missing session cookie");
+      // treat missing cookie as guest — do not throw
       return null;
     }
 
@@ -192,12 +192,10 @@ class SDKServer {
       const { openId, appId, name } = payload as Record<string, unknown>;
 
       if (!isNonEmptyString(openId) || !isNonEmptyString(appId)) {
-        console.warn("[Auth] Session payload missing required fields");
         return null;
       }
 
       if (appId !== ENV.appId) {
-        console.warn("[Auth] Session appId mismatch");
         return null;
       }
 
@@ -207,7 +205,7 @@ class SDKServer {
         name: typeof name === "string" ? name : "",
       };
     } catch (error) {
-      console.warn("[Auth] Session verification failed", String(error));
+      // treat verification failures as guest
       return null;
     }
   }
@@ -234,7 +232,7 @@ class SDKServer {
     } as GetUserInfoWithJwtResponse;
   }
 
-  async authenticateRequest(req: Request): Promise<AuthenticatedUser> {
+  async authenticateRequest(req: Request): Promise<AuthenticatedUser | null> {
     // Regular authentication flow
     const authHeader = req.headers.authorization || req.headers.Authorization;
     let token: string | undefined;
@@ -247,7 +245,8 @@ class SDKServer {
     const session = await this.verifySession(sessionCookie);
 
     if (!session) {
-      throw ForbiddenError("Invalid session cookie");
+      // No valid session — treat as guest
+      return null;
     }
 
     if (session.openId.startsWith(CRON_OPEN_ID_PREFIX)) {
@@ -267,13 +266,16 @@ class SDKServer {
     if (!user) {
       try {
         const userInfo = await this.getUserInfoWithJwt(sessionCookie ?? "");
+        // Protect admin role: do not auto-grant admin unless email matches ownerEmail
+        const roleToSet = userInfo.email === ENV.ownerEmail ? "admin" : undefined;
         await db.upsertUser({
           openId: userInfo.openId,
           name: userInfo.name || null,
           email: userInfo.email ?? null,
           loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
           lastSignedIn: signedInAt,
-        });
+          role: roleToSet as any,
+        } as any);
         user = await db.getUserByOpenId(userInfo.openId);
       } catch (error) {
         console.error("[Auth] Failed to sync user from OAuth:", error);
@@ -283,6 +285,13 @@ class SDKServer {
 
     if (!user) {
       throw ForbiddenError("User not found");
+    }
+
+    // If existing user in DB: ensure role is not escalated inadvertently
+    if (user.email === ENV.ownerEmail && user.role !== "admin") {
+      // ensure owner has admin role
+      await db.upsertUser({ openId: user.openId, role: "admin" } as any);
+      user = await db.getUserByOpenId(user.openId);
     }
 
     await db.upsertUser({
