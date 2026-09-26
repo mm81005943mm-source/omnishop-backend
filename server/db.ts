@@ -1,23 +1,397 @@
 import { and, desc, eq, gte, like, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users, products, orders, orderItems, coupons, addresses, favorites, reviews } from "../drizzle/schema";
+import {
+  InsertUser,
+  users,
+  products,
+  orders,
+  orderItems,
+  coupons,
+  addresses,
+  favorites,
+  reviews,
+} from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
-export async function getDb() { if (!_db && process.env.DATABASE_URL) _db = drizzle(process.env.DATABASE_URL); return _db; }
-export async function upsertUser(user: InsertUser): Promise<void> { if (!user.openId) throw new Error("User openId is required"); const db = await getDb(); if (!db) throw new Error("Database is not configured"); await db.insert(users).values(user).onDuplicateKeyUpdate({ set: user }); }
-export async function getUserByOpenId(openId: string) { const db = await getDb(); if (!db) return undefined; return (await db.select().from(users).where(eq(users.openId, openId)).limit(1))[0]; }
-export async function listProducts(input: { includeInactive?: boolean; query?: string; category?: string; minPrice?: number; maxPrice?: number; sort?: "newest" | "price_asc" | "price_desc" }) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); let q = db.select().from(products); if (!input.includeInactive) q = q.where(eq(products.isActive, 1)); if (input.query) q = q.where(like(products.name, `%${input.query}%`)); if (input.category) q = q.where(eq(products.category, input.category)); if (input.minPrice !== undefined) q = q.where(gte(products.price, input.minPrice)); if (input.maxPrice !== undefined) q = q.where(gte(input.maxPrice, products.price)); if (input.sort === "price_asc") q = q.orderBy(products.price); else if (input.sort === "price_desc") q = q.orderBy(desc(products.price)); else q = q.orderBy(desc(products.id)); return q; }
-export async function listUserOrders(userId: number) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); const rows = await db.select().from(orders).where(eq(orders.userId, userId)).orderBy(desc(orders.createdAt)); return rows; }
-export async function listAllOrders() { const db = await getDb(); if (!db) throw new Error("Database is not configured"); return db.select().from(orders).orderBy(desc(orders.createdAt)); }
-export async function getAdminStats() { const db = await getDb(); if (!db) throw new Error("Database is not configured"); const [productCount, orderCount, customerCount, sales] = await Promise.all([(await db.select({ count: sql<number>`COUNT(*)` }).from(products).where(eq(products.isActive, 1)))[0].count, (await db.select({ count: sql<number>`COUNT(*)` }).from(orders))[0].count, (await db.select({ count: sql<number>`COUNT(DISTINCT userId)` }).from(orders))[0].count, (await db.select({ total: sql<number>`COALESCE(SUM(total), 0)` }).from(orders).where(eq(orders.status, "delivered")))[0].total]); return { productCount, orderCount, customerCount, sales }; }
-export async function createOrder(input: { userId: number; items: Array<{ productId: number; quantity: number }>; addressId?: number; couponCode?: string; idempotencyKey: string }) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); return db.transaction(async (tx) => { const existingByKey = await tx.select().from(orders).where(eq(orders.idempotencyKey, input.idempotencyKey)).limit(1); if (existingByKey.length > 0) return existingByKey[0]; const lineItems = await Promise.all(input.items.map(async (item) => { const product = (await tx.select().from(products).where(eq(products.id, item.productId)).limit(1))[0]; if (!product) throw new Error(`Product ${item.productId} not found`); if (product.isActive !== 1) throw new Error(`Product ${item.productId} is not available`); if (product.stock < item.quantity) throw new Error(`Product ${item.productId} has insufficient stock (${product.stock} available, ${item.quantity} requested)`); return { product, quantity: item.quantity }; })); const subtotal = lineItems.reduce((sum, item) => sum + Number(item.product.price) * item.quantity, 0); let discount = 0; if (input.couponCode) { const coupon = (await tx.select().from(coupons).where(eq(coupons.code, input.couponCode.toUpperCase())).limit(1))[0]; if (coupon) { if (subtotal >= coupon.minimumOrder) { discount = subtotal * (coupon.percentOff / 100); if (coupon.maxDiscount !== null && discount > coupon.maxDiscount) discount = coupon.maxDiscount; } } } for (const item of lineItems) { const result = await tx.update(products).set({ stock: sql`${products.stock} - ${item.quantity}` }).where(and(eq(products.id, item.product.id), eq(products.isActive, 1))).catch(() => ({ rowsAffected: 0 })); if ((result as any)?.rowsAffected === 0) throw new Error(`Stock update failed for product ${item.product.id}: may have been deleted or deactivated`); } const total = Math.max(0, subtotal - discount); const orderNumber = `OM-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 1000).toString().padStart(3, "0")}`; const inserted = await tx.insert(orders).values({ userId: input.userId, orderNumber, status: "pending", subtotal: subtotal.toFixed(2), discount: discount.toFixed(2), total: total.toFixed(2), idempotencyKey: input.idempotencyKey, addressId: input.addressId || null, couponCode: input.couponCode || null, createdAt: new Date(), updatedAt: new Date() }).$returningId(); const orderId = inserted[0].id; if (!orderId) throw new Error("Failed to create order"); for (const item of lineItems) { await tx.insert(orderItems).values({ orderId, productId: item.product.id, productName: item.product.name, quantity: item.quantity, price: item.product.price, createdAt: new Date(), updatedAt: new Date() }); } return (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0]; }); }
-const nextStatus: Record<string, string[]> = { pending: ["processing", "cancelled"], processing: ["shipped", "cancelled"], shipped: ["delivered"], delivered: [], cancelled: [] };
-export async function updateOrderStatus(orderId: number, status: "pending" | "processing" | "shipped" | "delivered" | "cancelled") { const db = await getDb(); if (!db) throw new Error("Database is not configured"); return db.transaction(async (tx) => { const order = (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0]; if (!order) throw new Error("Order not found"); const allowed = nextStatus[order.status] || []; if (!allowed.includes(status)) throw new Error(`Cannot transition from ${order.status} to ${status}`); if (status === "cancelled" && order.status !== "pending" && order.status !== "processing") throw new Error("Can only cancel pending or processing orders"); if (status === "cancelled") { const items = await tx.select().from(orderItems).where(eq(orderItems.orderId, orderId)); for (const item of items) { await tx.update(products).set({ stock: sql`${products.stock} + ${item.quantity}` }).where(eq(products.id, item.productId)); } } await tx.update(orders).set({ status, updatedAt: new Date() }).where(eq(orders.id, orderId)); return (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0]; }); }
-export async function listAddresses(userId: number) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); return db.select().from(addresses).where(eq(addresses.userId, userId)); }
-export async function addAddress(userId: number, input: { label: string; line1: string; city: string; country: string; isDefault?: boolean }) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); if (input.isDefault) { await db.update(addresses).set({ isDefault: 0 }).where(eq(addresses.userId, userId)); } return db.insert(addresses).values({ userId, ...input, isDefault: input.isDefault ? 1 : 0, createdAt: new Date(), updatedAt: new Date() }).$returningId(); }
-export async function listFavorites(userId: number) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); return db.select({ favorite: favorites, product: products }).from(favorites).where(eq(favorites.userId, userId)).innerJoin(products, eq(products.id, favorites.productId)); }
-export async function toggleFavorite(userId: number, productId: number) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); const existing = await db.select().from(favorites).where(and(eq(favorites.userId, userId), eq(favorites.productId, productId))).limit(1); if (existing.length > 0) { await db.delete(favorites).where(and(eq(favorites.userId, userId), eq(favorites.productId, productId))); return { added: false }; } else { await db.insert(favorites).values({ userId, productId, createdAt: new Date(), updatedAt: new Date() }); return { added: true }; } }
-export async function listReviews(productId: number) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); return db.select().from(reviews).where(eq(reviews.productId, productId)); }
-export async function addReview(userId: number, input: { productId: number; rating: number; body?: string }) { const db = await getDb(); if (!db) throw new Error("Database is not configured"); if (input.rating < 1 || input.rating > 5) throw new Error("Rating must be between 1 and 5"); return db.insert(reviews).values({ userId, productId: input.productId, rating: input.rating, body: input.body || null, createdAt: new Date(), updatedAt: new Date() }).$returningId(); }
+
+export async function getDb() {
+  if (!_db && process.env.DATABASE_URL) {
+    _db = drizzle(process.env.DATABASE_URL);
+  }
+  return _db;
+}
+
+export async function upsertUser(user: InsertUser): Promise<void> {
+  if (!user.openId) throw new Error("User openId is required");
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  await db.insert(users).values(user).onDuplicateKeyUpdate({ set: user });
+}
+
+export async function getUserByOpenId(openId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  return (await db.select().from(users).where(eq(users.openId, openId)).limit(1))[0];
+}
+
+export async function listProducts(input: {
+  includeInactive?: boolean;
+  query?: string;
+  category?: string;
+  minPrice?: number;
+  maxPrice?: number;
+  sort?: "newest" | "price_asc" | "price_desc";
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  let q = db.select().from(products);
+
+  if (!input.includeInactive) {
+    q = q.where(eq(products.isActive, 1));
+  }
+
+  if (input.query) {
+    q = q.where(like(products.name, `%${input.query}%`));
+  }
+
+  if (input.category) {
+    q = q.where(eq(products.category, input.category));
+  }
+
+  if (input.minPrice !== undefined) {
+    q = q.where(gte(products.price, input.minPrice.toString()));
+  }
+
+  if (input.maxPrice !== undefined) {
+    q = q.where(gte(input.maxPrice.toString(), products.price));
+  }
+
+  if (input.sort === "price_asc") {
+    q = q.orderBy(products.price);
+  } else if (input.sort === "price_desc") {
+    q = q.orderBy(desc(products.price));
+  } else {
+    q = q.orderBy(desc(products.id));
+  }
+
+  return q;
+}
+
+export async function listUserOrders(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  const rows = await db
+    .select()
+    .from(orders)
+    .where(eq(orders.userId, userId))
+    .orderBy(desc(orders.createdAt));
+  return rows;
+}
+
+export async function listAllOrders() {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  return db.select().from(orders).orderBy(desc(orders.createdAt));
+}
+
+export async function getAdminStats() {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  const [productCount, orderCount, customerCount, sales] = await Promise.all([
+    (await db.select({ count: sql<number>`COUNT(*)` }).from(products).where(eq(products.isActive, 1)))[0]
+      .count,
+    (await db.select({ count: sql<number>`COUNT(*)` }).from(orders))[0].count,
+    (await db.select({ count: sql<number>`COUNT(DISTINCT userId)` }).from(orders))[0].count,
+    (await db
+      .select({ total: sql<number>`COALESCE(SUM(total), 0)` })
+      .from(orders)
+      .where(eq(orders.status, "delivered")))[0].total,
+  ]);
+
+  return { productCount, orderCount, customerCount, sales };
+}
+
+export async function createOrder(input: {
+  userId: number;
+  items: Array<{ productId: number; quantity: number }>;
+  addressId?: number;
+  couponCode?: string;
+  idempotencyKey: string;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  return db.transaction(async (tx) => {
+    // Check for duplicate order using idempotency key
+    const existingByKey = await tx
+      .select()
+      .from(orders)
+      .where(eq(orders.idempotencyKey, input.idempotencyKey))
+      .limit(1);
+
+    if (existingByKey.length > 0) {
+      return existingByKey[0];
+    }
+
+    // Validate stock availability before creating order
+    const lineItems = await Promise.all(
+      input.items.map(async (item) => {
+        const product = (await tx
+          .select()
+          .from(products)
+          .where(eq(products.id, item.productId))
+          .limit(1))[0];
+
+        if (!product) throw new Error(`Product ${item.productId} not found`);
+        if (product.isActive !== 1) throw new Error(`Product ${item.productId} is not available`);
+        if (product.stock < item.quantity) {
+          throw new Error(
+            `Product ${item.productId} has insufficient stock (${product.stock} available, ${item.quantity} requested)`,
+          );
+        }
+
+        return { product, quantity: item.quantity };
+      }),
+    );
+
+    // Calculate subtotal
+    const subtotal = lineItems.reduce(
+      (sum, item) => sum + Number(item.product.price) * item.quantity,
+      0,
+    );
+
+    // Apply coupon if provided
+    let discount = 0;
+    if (input.couponCode) {
+      const coupon = (await tx
+        .select()
+        .from(coupons)
+        .where(eq(coupons.code, input.couponCode.toUpperCase()))
+        .limit(1))[0];
+
+      if (coupon) {
+        if (subtotal >= coupon.minimumOrder) {
+          discount = subtotal * (coupon.percentOff / 100);
+          if (coupon.maxDiscount !== null && discount > coupon.maxDiscount) {
+            discount = coupon.maxDiscount;
+          }
+        }
+      }
+    }
+
+    // Atomically reduce stock for all items
+    for (const item of lineItems) {
+      const result = await tx
+        .update(products)
+        .set({ stock: sql`${products.stock} - ${item.quantity}` })
+        .where(and(eq(products.id, item.product.id), eq(products.isActive, 1)))
+        .catch(() => ({ rowsAffected: 0 }));
+
+      if ((result as any)?.rowsAffected === 0) {
+        throw new Error(
+          `Stock update failed for product ${item.product.id}: may have been deleted or deactivated`,
+        );
+      }
+    }
+
+    // Create order
+    const total = Math.max(0, subtotal - discount);
+    const orderNumber = `OM-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 1000)
+      .toString()
+      .padStart(3, "0")}`;
+
+    const inserted = await tx
+      .insert(orders)
+      .values({
+        userId: input.userId,
+        orderNumber,
+        status: "pending",
+        subtotal: subtotal.toFixed(2),
+        discount: discount.toFixed(2),
+        total: total.toFixed(2),
+        idempotencyKey: input.idempotencyKey,
+        addressId: input.addressId || null,
+        couponCode: input.couponCode || null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .$returningId();
+
+    const orderId = inserted[0].id;
+    if (!orderId) throw new Error("Failed to create order");
+
+    // Add order items
+    for (const item of lineItems) {
+      await tx.insert(orderItems).values({
+        orderId,
+        productId: item.product.id,
+        productName: item.product.name,
+        quantity: item.quantity,
+        price: item.product.price,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    }
+
+    return (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
+  });
+}
+
+const nextStatus: Record<string, string[]> = {
+  pending: ["processing", "cancelled"],
+  processing: ["shipped", "cancelled"],
+  shipped: ["delivered"],
+  delivered: [],
+  cancelled: [],
+};
+
+export async function updateOrderStatus(
+  orderId: number,
+  status: "pending" | "processing" | "shipped" | "delivered" | "cancelled",
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  return db.transaction(async (tx) => {
+    const order = (await tx
+      .select()
+      .from(orders)
+      .where(eq(orders.id, orderId))
+      .limit(1))[0];
+
+    if (!order) throw new Error("Order not found");
+
+    const allowed = nextStatus[order.status] || [];
+    if (!allowed.includes(status)) {
+      throw new Error(`Cannot transition from ${order.status} to ${status}`);
+    }
+
+    if (status === "cancelled" && order.status !== "pending" && order.status !== "processing") {
+      throw new Error("Can only cancel pending or processing orders");
+    }
+
+    // Restore stock if cancelling
+    if (status === "cancelled") {
+      const items = await tx.select().from(orderItems).where(eq(orderItems.orderId, orderId));
+      for (const item of items) {
+        await tx
+          .update(products)
+          .set({ stock: sql`${products.stock} + ${item.quantity}` })
+          .where(eq(products.id, item.productId));
+      }
+    }
+
+    await tx
+      .update(orders)
+      .set({ status, updatedAt: new Date() })
+      .where(eq(orders.id, orderId));
+
+    return (await tx.select().from(orders).where(eq(orders.id, orderId)).limit(1))[0];
+  });
+}
+
+export async function listAddresses(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  return db.select().from(addresses).where(eq(addresses.userId, userId));
+}
+
+export async function addAddress(
+  userId: number,
+  input: {
+    label: string;
+    line1: string;
+    city: string;
+    country: string;
+    isDefault?: boolean;
+  },
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  if (input.isDefault) {
+    await db.update(addresses).set({ isDefault: 0 }).where(eq(addresses.userId, userId));
+  }
+
+  return db
+    .insert(addresses)
+    .values({
+      userId,
+      ...input,
+      isDefault: input.isDefault ? 1 : 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .$returningId();
+}
+
+export async function listFavorites(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  return db
+    .select({ favorite: favorites, product: products })
+    .from(favorites)
+    .where(eq(favorites.userId, userId))
+    .innerJoin(products, eq(products.id, favorites.productId));
+}
+
+export async function toggleFavorite(userId: number, productId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  const existing = await db
+    .select()
+    .from(favorites)
+    .where(and(eq(favorites.userId, userId), eq(favorites.productId, productId)))
+    .limit(1);
+
+  if (existing.length > 0) {
+    await db
+      .delete(favorites)
+      .where(and(eq(favorites.userId, userId), eq(favorites.productId, productId)));
+    return { added: false };
+  } else {
+    await db.insert(favorites).values({
+      userId,
+      productId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return { added: true };
+  }
+}
+
+export async function listReviews(productId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  return db.select().from(reviews).where(eq(reviews.productId, productId));
+}
+
+export async function addReview(
+  userId: number,
+  input: { productId: number; rating: number; body?: string },
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+
+  if (input.rating < 1 || input.rating > 5) {
+    throw new Error("Rating must be between 1 and 5");
+  }
+
+  return db
+    .insert(reviews)
+    .values({
+      userId,
+      productId: input.productId,
+      rating: input.rating,
+      body: input.body || null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .$returningId();
+}
+
 export { users, products, orders, orderItems, coupons, addresses, favorites, reviews };
