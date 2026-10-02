@@ -1,31 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
-import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerUsernamePasswordAuth, registerOAuthRoutes, registerCommonAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { ENV } from "./env";
-
-function isPortAvailable(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const server = net.createServer();
-    server.listen(port, () => {
-      server.close(() => resolve(true));
-    });
-    server.on("error", () => resolve(false));
-  });
-}
-
-async function findAvailablePort(startPort: number = 3000): Promise<number> {
-  if (ENV.isProduction) return ENV.port;
-  for (let port = startPort; port < startPort + 20; port++) {
-    if (await isPortAvailable(port)) return port;
-  }
-  throw new Error(`No available port found starting from ${startPort}`);
-}
 
 async function startServer() {
   const app = express();
@@ -87,16 +68,7 @@ async function startServer() {
     })
   );
 
-  const port = await findAvailablePort(ENV.port);
-
-  if (ENV.isProduction && port !== ENV.port) {
-    console.error(`ERROR: Production requires PORT=${ENV.port}; refusing to use a fallback port.`);
-    process.exit(1);
-  }
-
-  if (!ENV.isProduction && port !== ENV.port) {
-    console.log(`Port ${ENV.port} is busy, using port ${port} instead`);
-  }
+  const port = ENV.port;
 
   server.listen(port, () => {
     console.log(`[api] server listening on port ${port}`);
