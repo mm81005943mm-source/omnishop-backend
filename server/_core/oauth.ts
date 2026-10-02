@@ -15,6 +15,7 @@ import {
   verifyGoogleIdToken,
 } from "./google-oauth";
 import { sdk } from "./sdk";
+import { ENV } from "./env";
 
 function getQueryParam(req: Request, key: string): string | undefined {
   const value = req.query[key];
@@ -81,15 +82,142 @@ function consumeHandoff(code: string) {
   return handoff && handoff.expiresAt > Date.now() ? handoff : null;
 }
 
+export function registerUsernamePasswordAuth(app: Express) {
+  let usernameAuthReady: Promise<void> | null = null;
+  const ensureUsernameAuthTable = async () => {
+    if (!usernameAuthReady) {
+      usernameAuthReady = (async () => {
+        const db = await getDb();
+        if (!db) throw new Error("Database is not configured");
+        await db.execute(sql`CREATE TABLE IF NOT EXISTS username_credentials (
+          user_id INT NOT NULL PRIMARY KEY,
+          username VARCHAR(255) NOT NULL UNIQUE,
+          password_hash VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          CONSTRAINT username_credentials_user_fk FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )`);
+      })();
+    }
+    return usernameAuthReady;
+  };
+
+  const normalizeUsername = (value: unknown) =>
+    typeof value === "string" ? value.trim().toLowerCase().slice(0, 255) : "";
+
+  const hashPassword = (password: string) => {
+    const salt = randomBytes(16).toString("hex");
+    const derived = scryptSync(password, salt, 64).toString("hex");
+    return `${salt}:${derived}`;
+  };
+
+  const verifyPassword = (password: string, encoded: string) => {
+    const [salt, expected] = encoded.split(":");
+    if (!salt || !expected) return false;
+    const actual = scryptSync(password, salt, 64);
+    const target = Buffer.from(expected, "hex");
+    return target.length === actual.length && timingSafeEqual(actual, target);
+  };
+
+  const usernameUserResponse = (user: any) => ({
+    id: user?.id ?? null,
+    openId: user?.openId ?? null,
+    name: user?.name ?? null,
+    email: user?.email ?? null,
+    loginMethod: "username",
+    lastSignedIn: new Date().toISOString(),
+  });
+
+  const usernameAuth = async (req: Request, res: Response) => {
+    try {
+      await ensureUsernameAuthTable();
+      const username = normalizeUsername(req.body?.username);
+      const password = typeof req.body?.password === "string" ? req.body.password : "";
+      const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 120) : "";
+      const register = req.path.includes("/register");
+
+      if (!username || username.length < 3 || password.length < 8 || password.length > 128) {
+        res.status(400).json({
+          error: register
+            ? "Username (3+ chars), name, and password (8-128 chars) required"
+            : "Invalid username or password",
+        });
+        return;
+      }
+
+      if (register && !name) {
+        res.status(400).json({ error: "Name is required for registration" });
+        return;
+      }
+
+      const db = await getDb();
+      if (!db) throw new Error("Database is not configured");
+      const rows: any = await db.execute(
+        sql`SELECT user_id, password_hash FROM username_credentials WHERE username = ${username} LIMIT 1`
+      );
+      const credential = (rows as any)?.[0]?.[0] ?? (rows as any)?.[0] ?? null;
+
+      if (register) {
+        if (credential) {
+          res.status(409).json({ error: "Username already registered" });
+          return;
+        }
+        await upsertUser({
+          openId: `username:${username}`,
+          email: null,
+          name,
+          loginMethod: "username",
+          lastSignedIn: new Date(),
+        });
+        const user = await getUserByOpenId(`username:${username}`);
+        if (!user?.id) throw new Error("Could not create user");
+        await db.execute(
+          sql`INSERT INTO username_credentials (user_id, username, password_hash) VALUES (${user.id}, ${username}, ${hashPassword(password)})`
+        );
+        const token = await sdk.createSessionToken(`username:${username}`, {
+          name,
+          expiresInMs: ONE_YEAR_MS,
+        });
+        res.status(201).json({
+          app_session_id: token,
+          user: usernameUserResponse({ ...user, name }),
+        });
+        return;
+      }
+
+      if (!credential || !verifyPassword(password, credential.password_hash)) {
+        res.status(401).json({ error: "Invalid username or password" });
+        return;
+      }
+
+      const user = await getUserByOpenId(`username:${username}`);
+      if (!user) {
+        res.status(401).json({ error: "Invalid username or password" });
+        return;
+      }
+
+      await upsertUser({ openId: `username:${username}`, lastSignedIn: new Date() });
+      const token = await sdk.createSessionToken(`username:${username}`, {
+        name: user.name ?? "",
+        expiresInMs: ONE_YEAR_MS,
+      });
+      res.json({ app_session_id: token, user: usernameUserResponse(user) });
+    } catch (error) {
+      console.error("[Username Auth] failed", error instanceof Error ? error.message : "unknown error");
+      res.status(500).json({ error: "Authentication failed" });
+    }
+  };
+
+  app.post("/api/auth/username/register", usernameAuth);
+  app.post("/api/auth/username/login", usernameAuth);
+}
+
 export function registerOAuthRoutes(app: Express) {
-  // Native Android Google Sign-In: the app obtains the ID token with the
-  // native Google SDK and sends it directly to OmniShop. Do not use the
-  // browser OAuth callback for this flow.
+  if (!ENV.enableOAuth) return;
+
   app.post("/api/auth/google/native", async (req: Request, res: Response) => {
-    // Accept the deployed Web Client ID and the app's known public client ID.
-    // The token is still signature-verified by Google before it is accepted.
     const googleClientIds = [process.env.GOOGLE_CLIENT_ID_WEB?.trim(), DEFAULT_GOOGLE_WEB_CLIENT_ID]
       .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
+
     if (!googleClientIds.length) {
       res.status(503).json({ error: "Google OAuth is not configured" });
       return;
@@ -109,10 +237,11 @@ export function registerOAuthRoutes(app: Express) {
           verified = validateGoogleClaims(claims, clientId);
           break;
         } catch {
-          // Try the next explicitly configured public client ID.
+          // Try next client ID
         }
       }
       if (!verified) throw new Error("Google token did not match a configured client ID");
+
       const user = await syncUser({
         openId: `google:${verified.sub}`,
         name: verified.name ?? null,
@@ -120,96 +249,19 @@ export function registerOAuthRoutes(app: Express) {
         loginMethod: "google",
         platform: "native",
       });
+
       const sessionToken = await sdk.createSessionToken(`google:${verified.sub}`, {
         name: verified.name ?? "",
         expiresInMs: ONE_YEAR_MS,
       });
-      res.json({
-        app_session_id: sessionToken,
-        user: buildUserResponse(user),
-      });
+
+      res.json({ app_session_id: sessionToken, user: buildUserResponse(user) });
     } catch (error) {
       console.error("[Google Native] Sign-in failed", error instanceof Error ? error.message : "unknown error");
       res.status(401).json({ error: "Google authentication failed" });
     }
   });
 
-  // Email/password authentication does not depend on Google OAuth or Android signing.
-  let emailAuthReady: Promise<void> | null = null;
-  const ensureEmailAuthTable = async () => {
-    if (!emailAuthReady) {
-      emailAuthReady = (async () => {
-        const db = await getDb();
-        if (!db) throw new Error("Database is not configured");
-        await db.execute(sql`CREATE TABLE IF NOT EXISTS email_credentials (
-          user_id INT NOT NULL PRIMARY KEY,
-          email VARCHAR(320) NOT NULL UNIQUE,
-          password_hash VARCHAR(255) NOT NULL,
-          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          CONSTRAINT email_credentials_user_fk FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )`);
-      })();
-    }
-    return emailAuthReady;
-  };
-  const normalizeEmail = (value: unknown) => typeof value === "string" ? value.trim().toLowerCase() : "";
-  const hashPassword = (password: string) => {
-    const salt = randomBytes(16).toString("hex");
-    const derived = scryptSync(password, salt, 64).toString("hex");
-    return `${salt}:${derived}`;
-  };
-  const verifyPassword = (password: string, encoded: string) => {
-    const [salt, expected] = encoded.split(":");
-    if (!salt || !expected) return false;
-    const actual = scryptSync(password, salt, 64);
-    const target = Buffer.from(expected, "hex");
-    return target.length === actual.length && timingSafeEqual(actual, target);
-  };
-  const emailUserResponse = (user: any) => ({
-    id: user?.id ?? null, openId: user?.openId ?? null, name: user?.name ?? null,
-    email: user?.email ?? null, loginMethod: "email", lastSignedIn: new Date().toISOString(),
-  });
-  const emailAuth = async (req: Request, res: Response) => {
-    try {
-      await ensureEmailAuthTable();
-      const email = normalizeEmail(req.body?.email);
-      const password = typeof req.body?.password === "string" ? req.body.password : "";
-      const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, 120) : "";
-      const register = req.path.endsWith("/register");
-      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || password.length < 8 || password.length > 128 || (register && !name)) {
-        res.status(400).json({ error: register ? "أدخل الاسم والبريد وكلمة مرور من 8 أحرف على الأقل" : "البريد أو كلمة المرور غير صحيحة" });
-        return;
-      }
-      const db = await getDb();
-      if (!db) throw new Error("Database is not configured");
-      const rows: any = await db.execute(sql`SELECT user_id, password_hash FROM email_credentials WHERE email = ${email} LIMIT 1`);
-      const credential = (rows as any)?.[0]?.[0] ?? (rows as any)?.[0] ?? null;
-      if (register) {
-        if (credential) { res.status(409).json({ error: "هذا البريد مسجل مسبقًا" }); return; }
-        await upsertUser({ openId: `email:${email}`, email, name, loginMethod: "email", lastSignedIn: new Date() });
-        const user = await getUserByOpenId(`email:${email}`);
-        if (!user?.id) throw new Error("Could not create user");
-        await db.execute(sql`INSERT INTO email_credentials (user_id, email, password_hash) VALUES (${user.id}, ${email}, ${hashPassword(password)})`);
-        const token = await sdk.createSessionToken(`email:${email}`, { name, expiresInMs: ONE_YEAR_MS });
-        res.status(201).json({ app_session_id: token, user: emailUserResponse({ ...user, email, name }) });
-        return;
-      }
-      if (!credential || !verifyPassword(password, credential.password_hash)) { res.status(401).json({ error: "البريد أو كلمة المرور غير صحيحة" }); return; }
-      const user = await getUserByOpenId(`email:${email}`);
-      if (!user) { res.status(401).json({ error: "البريد أو كلمة المرور غير صحيحة" }); return; }
-      await upsertUser({ openId: `email:${email}`, lastSignedIn: new Date() });
-      const token = await sdk.createSessionToken(`email:${email}`, { name: user.name ?? "", expiresInMs: ONE_YEAR_MS });
-      res.json({ app_session_id: token, user: emailUserResponse(user) });
-    } catch (error) {
-      console.error("[Email Auth] failed", error instanceof Error ? error.message : "unknown error");
-      res.status(500).json({ error: "تعذر إكمال العملية، حاول مرة أخرى" });
-    }
-  };
-  app.post("/api/auth/email/register", emailAuth);
-  app.post("/api/auth/email/login", emailAuth);
-
-  // Direct Google OAuth start. The requested client redirect is only accepted when
-  // explicitly allowlisted in GOOGLE_CLIENT_REDIRECT_URIS.
   app.get("/api/auth/google", (req: Request, res: Response) => {
     const config = getGoogleOAuthConfig();
     const redirectUri = getQueryParam(req, "redirectUri");
@@ -222,8 +274,6 @@ export function registerOAuthRoutes(app: Express) {
       return;
     }
     const state = googleStates.issue(getQueryParam(req, "state"));
-    // Keep the app/web destination in server memory; Google only returns to the
-    // server callback URI registered in Google Cloud Console.
     (req.app as any).locals.googleRedirects ??= new Map<string, string>();
     (req.app as any).locals.googleRedirects.set(state, redirectUri);
     res.redirect(302, buildGoogleAuthorizationUrl(config, state));
@@ -248,6 +298,7 @@ export function registerOAuthRoutes(app: Express) {
       res.status(400).json({ error: "Unsupported OAuth client redirect URI" });
       return;
     }
+
     try {
       const config = getGoogleOAuthConfig();
       const tokens = await exchangeGoogleCode(config, code);
@@ -286,12 +337,12 @@ export function registerOAuthRoutes(app: Express) {
     res.cookie(COOKIE_NAME, handoff.sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
     res.json({ app_session_id: handoff.sessionToken, user: handoff.user });
   };
+
   app.get("/api/auth/google/exchange", exchangeGoogleHandoff);
   app.post("/api/auth/google/exchange", exchangeGoogleHandoff);
   app.get("/api/auth/google/mobile", exchangeGoogleHandoff);
   app.post("/api/auth/google/mobile", exchangeGoogleHandoff);
 
-  // Existing Manus OAuth callback remains unchanged.
   app.get("/api/oauth/callback", async (req: Request, res: Response) => {
     const code = getQueryParam(req, "code");
     const state = getQueryParam(req, "state");
@@ -304,7 +355,10 @@ export function registerOAuthRoutes(app: Express) {
       const tokenResponse = await sdk.exchangeCodeForToken(code, redirectUri);
       const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
       await syncUser(userInfo);
-      const sessionToken = await sdk.createSessionToken(userInfo.openId!, { name: userInfo.name || "", expiresInMs: ONE_YEAR_MS });
+      const sessionToken = await sdk.createSessionToken(userInfo.openId!, {
+        name: userInfo.name || "",
+        expiresInMs: ONE_YEAR_MS,
+      });
       res.cookie(COOKIE_NAME, sessionToken, { ...getSessionCookieOptions(req), maxAge: ONE_YEAR_MS });
       res.redirect(302, process.env.EXPO_WEB_PREVIEW_URL || process.env.EXPO_PACKAGER_PROXY_URL || "http://localhost:8081");
     } catch (error) {
@@ -313,7 +367,6 @@ export function registerOAuthRoutes(app: Express) {
     }
   });
 
-  // Existing Manus mobile exchange remains available.
   app.get("/api/oauth/mobile", async (req: Request, res: Response) => {
     const code = getQueryParam(req, "code");
     const state = getQueryParam(req, "state");
@@ -326,7 +379,10 @@ export function registerOAuthRoutes(app: Express) {
       const tokenResponse = await sdk.exchangeCodeForToken(code, redirectUri);
       const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
       const user = await syncUser(userInfo);
-      const sessionToken = await sdk.createSessionToken(userInfo.openId!, { name: user.name || "", expiresInMs: ONE_YEAR_MS });
+      const sessionToken = await sdk.createSessionToken(userInfo.openId!, {
+        name: user.name || "",
+        expiresInMs: ONE_YEAR_MS,
+      });
       res.cookie(COOKIE_NAME, sessionToken, { ...getSessionCookieOptions(req), maxAge: ONE_YEAR_MS });
       res.json({ app_session_id: sessionToken, user: buildUserResponse(user) });
     } catch (error) {
@@ -334,7 +390,9 @@ export function registerOAuthRoutes(app: Express) {
       res.status(500).json({ error: "OAuth mobile exchange failed" });
     }
   });
+}
 
+export function registerCommonAuthRoutes(app: Express) {
   app.post("/api/auth/logout", (req: Request, res: Response) => {
     res.clearCookie(COOKIE_NAME, { ...getSessionCookieOptions(req), maxAge: -1 });
     res.json({ success: true });
@@ -343,23 +401,23 @@ export function registerOAuthRoutes(app: Express) {
   app.get("/api/auth/me", async (req: Request, res: Response) => {
     try {
       const user = await sdk.authenticateRequest(req);
-      res.json({ user: buildUserResponse(user) });
+      res.json({ user: user ? buildUserResponse(user) : null });
     } catch {
-      res.status(401).json({ error: "Not authenticated", user: null });
+      res.json({ user: null });
     }
   });
 
   app.post("/api/auth/session", async (req: Request, res: Response) => {
     try {
-      const user = await sdk.authenticateRequest(req);
       const authHeader = req.headers.authorization || req.headers.Authorization;
       if (typeof authHeader !== "string" || !authHeader.startsWith("Bearer ")) {
         res.status(400).json({ error: "Bearer token required" });
         return;
       }
       const token = authHeader.slice("Bearer ".length).trim();
+      const user = await sdk.authenticateRequest(req);
       res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(req), maxAge: ONE_YEAR_MS });
-      res.json({ success: true, user: buildUserResponse(user) });
+      res.json({ success: true, user: user ? buildUserResponse(user) : null });
     } catch {
       res.status(401).json({ error: "Invalid token" });
     }
